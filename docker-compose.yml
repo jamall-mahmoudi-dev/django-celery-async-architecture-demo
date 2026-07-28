@@ -1,0 +1,156 @@
+name: celery-drf-demo
+
+services:
+  django:
+    build:
+      context: .
+      dockerfile: docker/django/Dockerfile
+    image: celery-drf-demo/django:latest
+    env_file:
+      - .env
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             python manage.py collectstatic --noinput &&
+             gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 3"
+    volumes:
+      - ./src:/app/src
+      - static_files:/app/src/staticfiles
+    expose:
+      - "8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      smtp4dev:
+        condition: service_started
+    networks:
+      - demo
+
+  celery-worker:
+    build:
+      context: .
+      dockerfile: docker/django/Dockerfile
+    image: celery-drf-demo/django:latest
+    env_file:
+      - .env
+    command: celery -A config worker --loglevel=info
+    volumes:
+      - ./src:/app/src
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      django:
+        condition: service_started
+    networks:
+      - demo
+
+  celery-beat:
+    build:
+      context: .
+      dockerfile: docker/django/Dockerfile
+    image: celery-drf-demo/django:latest
+    env_file:
+      - .env
+    # --schedule points celerybeat-schedule (its persistence file) at
+    # a writable path — default is the current dir, which is fine
+    # here since /app/src is our bind-mounted, writable working dir.
+    command: celery -A config beat --loglevel=info --schedule=/app/src/celerybeat-schedule
+    volumes:
+      - ./src:/app/src
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      django:
+        condition: service_started
+    networks:
+      - demo
+
+  flower:
+    build:
+      context: .
+      dockerfile: docker/django/Dockerfile
+    image: celery-drf-demo/django:latest
+    env_file:
+      - .env
+    command: celery -A config flower --port=5555 --url_prefix=flower
+    ports:
+      - "5555:5555"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - demo
+
+  postgres:
+    image: postgres:17-alpine
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-celery_drf_demo}
+      POSTGRES_USER: ${POSTGRES_USER:-celery_drf_demo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-celery_drf_demo}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - demo
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - demo
+
+  smtp4dev:
+    image: rnwood/smtp4dev:v3
+    ports:
+      - "5000:80"    # web UI — open http://localhost:5000 to see caught emails
+      - "2525:25"    # SMTP port, published only for optional external debugging
+    networks:
+      - demo
+
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - static_files:/app/staticfiles:ro
+    ports:
+      - "80:80"
+    depends_on:
+      django:
+        condition: service_started
+    networks:
+      - demo
+
+  locust:
+    image: locustio/locust:2.32.3
+    volumes:
+      - ./locustfile.py:/mnt/locust/locustfile.py:ro
+    ports:
+      - "8089:8089"
+    command: -f /mnt/locust/locustfile.py --host=http://nginx
+    depends_on:
+      - nginx
+    networks:
+      - demo
+
+networks:
+  demo:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  static_files:
